@@ -1,0 +1,4 @@
+# Self-hosted VM: automatic HTTPS in front of the container.
+waypoint.example.com {
+    reverse_proxy 127.0.0.1:8000
+}

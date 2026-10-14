@@ -1,0 +1,11 @@
+services:
+  waypoint:
+    build: .
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"   # bind locally; expose publicly only through Caddy / Cloudflare / Tailscale
+    volumes:
+      - waypoint_data:/data
+    restart: unless-stopped
+volumes:
+  waypoint_data:

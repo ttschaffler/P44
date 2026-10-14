@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waypoint</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --text:#1c2430; --muted:#5d6b7a; --line:#dde2e8; --accent:#2f6fde;
+          --ok:#1f8a5b; --warn:#b7791f; --bad:#c53030; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12161c; --panel:#1b2129; --text:#e6ebf1; --muted:#97a3b1; --line:#2c3540; --accent:#6c9cff;
+            --ok:#4cc38a; --warn:#e0b252; --bad:#f07070; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  nav button { background:none; border:0; color:var(--muted); padding:6px 10px; cursor:pointer; font:inherit; border-radius:6px; }
+  nav button.on { color:var(--text); background:var(--bg); font-weight:600; }
+  .who { margin-left:auto; color:var(--muted); }
+  main { padding:16px; max-width:1400px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .grid { display:grid; grid-template-columns: minmax(0,1.3fr) minmax(0,1fr); gap:14px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  #map { height:420px; border-radius:8px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  tr.click { cursor:pointer; } tr.click:hover { background:var(--bg); }
+  .scroll { overflow-x:auto; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; border:1px solid var(--line); }
+  .pill.bad { color:var(--bad); border-color:var(--bad); } .pill.warn { color:var(--warn); border-color:var(--warn); }
+  .pill.ok { color:var(--ok); border-color:var(--ok); }
+  .tiles { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap:10px; }
+  .tile { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .tile b { display:block; font-size:24px; } .tile span { color:var(--muted); font-size:12px; }
+  input, select, button.btn { font:inherit; padding:7px 10px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--text); }
+  button.btn { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; }
+  button.ghost { background:none; color:var(--accent); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  .login { max-width:360px; margin:10vh auto; }
+  .login input { width:100%; margin-bottom:10px; }
+  .muted { color:var(--muted); } .err { color:var(--bad); min-height:1.4em; }
+  code { font-size:12px; word-break:break-all; }
+  .timeline li { margin-bottom:4px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const $ = (s, el=document) => el.querySelector(s);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = ts => ts ? new Date(ts).toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"}) : "—";
+const store = { get(k){ try { return sessionStorage.getItem(k); } catch { return null; } },
+                set(k,v){ try { v==null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k,v); } catch {} } };
+let token = store.get("wp_token"), me = null, view = "shipments", map = null, layer = null;
+
+async function api(path, opts={}) {
+  const res = await fetch(path, { ...opts, headers: { "Content-Type":"application/json",
+    ...(token ? { Authorization: "Bearer " + token } : {}), ...(opts.headers||{}) } });
+  if (res.status === 401 && token) { token = null; store.set("wp_token", null); render(); throw new Error("Session expired"); }
+  if (!res.ok) { let d; try { d = (await res.json()).detail; } catch {} throw new Error(typeof d === "string" ? d : JSON.stringify(d) || res.statusText); }
+  return res.status === 204 ? null : res.json();
+}
+
+function statusPill(s) {
+  const cls = s === "DELIVERED" ? "ok" : s === "CANCELLED" ? "" : s === "PLANNED" ? "" : "warn";
+  return `<span class="pill ${cls}">${esc(s.replaceAll("_"," ").toLowerCase())}</span>`;
+}
+function excPills(list) {
+  return list.map(e => `<span class="pill ${e.severity === "high" ? "bad" : "warn"}">${esc(e.type.replaceAll("_"," ").toLowerCase())}</span>`).join(" ");
+}
+
+// ---------- auth screens ----------
+function loginView() {
+  const invite = new URLSearchParams(location.search).get("invite");
+  $("#app").innerHTML = `<div class="card login">
+    <h2>${invite ? "Accept your invitation" : "Sign in to Waypoint"}</h2>
+    ${invite ? `<p class="muted">Choose a password (10+ characters) to activate your account.</p>` :
+               `<input id="email" type="email" placeholder="Email" autocomplete="username">`}
+    <input id="pw" type="password" placeholder="Password" autocomplete="${invite ? "new-password" : "current-password"}">
+    <div class="err" id="err"></div>
+    <button class="btn" id="go">${invite ? "Activate account" : "Sign in"}</button>
+    <p class="muted">Access is by invitation only.</p></div>`;
+  $("#go").onclick = async () => {
+    try {
+      const r = invite ? await api("/api/invites/accept", { method:"POST", body: JSON.stringify({ token: invite, password: $("#pw").value }) })
+                       : await api("/api/auth/login", { method:"POST", body: JSON.stringify({ email: $("#email").value, password: $("#pw").value }) });
+      token = r.token; store.set("wp_token", token);
+      if (invite) history.replaceState(null, "", "/");
+      render();
+    } catch (e) { $("#err").textContent = e.message; }
+  };
+  $("#pw").onkeydown = e => { if (e.key === "Enter") $("#go").click(); };
+}
+
+// ---------- shell ----------
+async function render() {
+  if (!token) return loginView();
+  try { me = await api("/api/auth/me"); } catch { return; }
+  const tabs = ["shipments","orders","exceptions","analytics", ...(me.role === "admin" ? ["admin"] : [])];
+  $("#app").innerHTML = `<header><h1>Waypoint</h1>
+    <nav>${tabs.map(t => `<button data-t="${t}" class="${t===view?"on":""}">${t[0].toUpperCase()+t.slice(1)}</button>`).join("")}</nav>
+    <span class="who">${esc(me.name)} · ${esc(me.role)} <button class="btn ghost" id="out">Sign out</button></span></header><main id="main"></main>`;
+  document.querySelectorAll("nav button").forEach(b => b.onclick = () => { view = b.dataset.t; render(); });
+  $("#out").onclick = async () => { try { await api("/api/auth/logout", {method:"POST"}); } catch {} token = null; store.set("wp_token", null); render(); };
+  map = null;
+  ({ shipments, orders, exceptions, analytics, admin })[view]();
+}
+
+// ---------- shipments ----------
+async function shipments() {
+  const carriers = await api("/api/carriers");
+  $("#main").innerHTML = `<div class="row">
+      <select id="f-mode"><option value="">All modes</option>${["TL","LTL","PARCEL","OCEAN","AIR","RAIL"].map(m=>`<option>${m}</option>`).join("")}</select>
+      <select id="f-carrier"><option value="">All carriers</option>${carriers.map(c=>`<option value="${esc(c.code)}">${esc(c.name)}</option>`).join("")}</select>
+      <select id="f-status"><option value="">Any status</option>${["PLANNED","PICKED_UP","IN_TRANSIT","AT_STOP","OUT_FOR_DELIVERY","DELIVERED","CANCELLED"].map(s=>`<option>${s}</option>`).join("")}</select>
+      <label><input type="checkbox" id="f-exc"> Exceptions only</label></div>
+    <div class="grid"><div class="card"><div id="map"></div></div><div class="card" id="detail"><p class="muted">Select a shipment to see its timeline.</p></div></div>
+    <div class="card scroll"><table id="tbl"></table></div>`;
+  if (window.L) {
+    map = L.map("map", { worldCopyJump:true }).setView([30, -40], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { attribution:"© OpenStreetMap contributors", maxZoom:18 }).addTo(map);
+    layer = L.layerGroup().addTo(map);
+  } else {
+    $("#map").innerHTML = `<p class="muted">Map unavailable (the map library could not load). Everything else works.</p>`;
+    $("#map").style.height = "auto";
+  }
+  ["f-mode","f-carrier","f-status","f-exc"].forEach(id => $("#"+id).onchange = loadShipments);
+  loadShipments();
+}
+
+async function loadShipments() {
+  const q = new URLSearchParams();
+  if ($("#f-mode").value) q.set("mode", $("#f-mode").value);
+  if ($("#f-carrier").value) q.set("carrier", $("#f-carrier").value);
+  if ($("#f-status").value) q.set("status", $("#f-status").value);
+  if ($("#f-exc").checked) q.set("exceptions_only", "true");
+  const rows = await api("/api/shipments?" + q);
+  $("#tbl").innerHTML = `<tr><th>Ref</th><th>Mode</th><th>Carrier</th><th>Lane</th><th>Status</th><th>Planned delivery</th><th>ETA</th><th>Exceptions</th></tr>` +
+    rows.map(r => `<tr class="click" data-ref="${esc(r.ref)}"><td>${esc(r.ref)}</td><td>${esc(r.mode)}</td><td>${esc(r.carrier_name)}</td>
+      <td>${esc(r.origin)} → ${esc(r.destination)}</td><td>${statusPill(r.status)}</td><td>${fmt(r.planned_delivery)}</td>
+      <td>${fmt(r.eta)}</td><td>${excPills(r.exceptions)}</td></tr>`).join("");
+  document.querySelectorAll("#tbl tr.click").forEach(tr => tr.onclick = () => showShipment(tr.dataset.ref));
+  if (!map) return;
+  layer.clearLayers();
+  rows.filter(r => r.position && !["DELIVERED","CANCELLED"].includes(r.status)).forEach(r => {
+    const color = r.exceptions.length ? getComputedStyle(document.body).getPropertyValue("--bad") : getComputedStyle(document.body).getPropertyValue("--accent");
+    L.circleMarker([r.position.lat, r.position.lon], { radius:7, color, fillOpacity:.8 })
+      .bindTooltip(`${r.ref} · ${r.mode}`).on("click", () => showShipment(r.ref)).addTo(layer);
+  });
+}
+
+async function showShipment(ref) {
+  const s = await api("/api/shipments/" + encodeURIComponent(ref));
+  $("#detail").innerHTML = `<h3 style="margin-top:0">${esc(s.ref)} <span class="muted">${esc(s.mode)} · ${esc(s.carrier_name)}</span></h3>
+    <p>${statusPill(s.status)} ${excPills(s.exceptions)}</p>
+    <p><b>ETA</b> ${fmt(s.eta)} · <b>Planned</b> ${fmt(s.planned_delivery)}${s.order_ref ? ` · <b>Order</b> ${esc(s.order_ref)}` : ""}</p>
+    <h4>Stops</h4><ol>${s.stops.map(st => `<li>${esc(st.name)} <span class="muted">${st.actual_arrival ? "arrived " + fmt(st.actual_arrival) : "pending"}</span></li>`).join("")}</ol>
+    <h4>Timeline</h4><ul class="timeline">${s.events.slice(0, 12).map(e => `<li>${fmt(e.ts)} · ${statusPill(e.status)} <span class="muted">"${esc(e.raw_status)}"</span></li>`).join("") || "<li class='muted'>No events yet</li>"}</ul>
+    ${["admin","member"].includes(me.role) && !["DELIVERED","CANCELLED"].includes(s.status) ? `<button class="btn ghost" id="cancel">Cancel shipment</button>` : ""}`;
+  if ($("#cancel")) $("#cancel").onclick = async () => { if (confirm("Cancel " + s.ref + "?")) { await api(`/api/shipments/${encodeURIComponent(s.ref)}/cancel`, {method:"POST"}); loadShipments(); showShipment(s.ref); } };
+  if (map) {
+    const line = s.stops.map(st => [st.lat, st.lon]);
+    const g = L.polyline(line, { dashArray:"4 6", weight:2 }).addTo(layer);
+    map.fitBounds(g.getBounds().pad(0.3));
+  }
+}
+
+// ---------- orders ----------
+async function orders() {
+  const rows = await api("/api/orders");
+  $("#main").innerHTML = `<div class="card scroll"><h3 style="margin-top:0">Orders</h3><table>
+    <tr><th>Order</th><th>Customer</th><th>Legs</th><th>Modes</th><th>Current leg</th><th>Status</th><th>Final ETA</th><th>Delay</th><th>Open exceptions</th></tr>
+    ${rows.map(o => `<tr class="click" data-ref="${esc(o.ref)}"><td>${esc(o.ref)}</td><td>${esc(o.customer)}</td><td>${o.legs}</td><td>${esc(o.modes.join(" + "))}</td>
+      <td>${esc(o.current_leg)}</td><td>${statusPill(o.status)}</td><td>${fmt(o.eta)}</td><td>${o.delay_h ? `<span class="pill ${o.delay_h > 24 ? "bad" : "warn"}">+${o.delay_h} h</span>` : "on plan"}</td><td>${o.open_exceptions}</td></tr>`).join("")}</table></div><div id="od"></div>`;
+  document.querySelectorAll("tr.click").forEach(tr => tr.onclick = async () => {
+    const o = await api("/api/orders/" + encodeURIComponent(tr.dataset.ref));
+    $("#od").innerHTML = `<div class="card scroll"><h3 style="margin-top:0">${esc(o.ref)} legs</h3><table><tr><th>Leg</th><th>Mode</th><th>Lane</th><th>Status</th><th>Planned delivery</th><th>Projected ETA</th><th>Exceptions</th></tr>
+      ${o.shipments.map(r => `<tr><td>${esc(r.ref)}</td><td>${esc(r.mode)}</td><td>${esc(r.origin)} → ${esc(r.destination)}</td><td>${statusPill(r.status)}</td><td>${fmt(r.planned_delivery)}</td><td>${fmt(r.projected_eta || r.eta)}</td><td>${excPills(r.exceptions)}</td></tr>`).join("")}</table></div>`;
+  });
+}
+
+// ---------- exceptions ----------
+async function exceptions() {
+  const rows = await api("/api/exceptions");
+  $("#main").innerHTML = `<div class="card scroll"><div class="row"><h3 style="margin:0">Open exceptions (${rows.length})</h3>
+    ${me.role !== "viewer" ? `<button class="btn ghost" id="sweep">Re-evaluate now</button>` : ""}</div><table>
+    <tr><th>Shipment</th><th>Mode</th><th>Type</th><th>Severity</th><th>Detail</th><th>Opened</th></tr>
+    ${rows.map(e => `<tr><td>${esc(e.shipment_ref)}</td><td>${esc(e.mode)}</td><td>${esc(e.type)}</td>
+      <td><span class="pill ${e.severity === "high" ? "bad" : "warn"}">${esc(e.severity)}</span></td><td>${esc(e.message)}</td><td>${fmt(e.opened_at)}</td></tr>`).join("")}</table></div>`;
+  if ($("#sweep")) $("#sweep").onclick = async () => { await api("/api/exceptions/sweep", {method:"POST"}); exceptions(); };
+}
+
+// ---------- analytics ----------
+async function analytics() {
+  const all = (await api("/api/analytics")).groups[0] || {};
+  const pct = v => v == null ? "—" : v + "%";
+  $("#main").innerHTML = `<div class="tiles">
+      <div class="tile"><span>Shipments</span><b>${all.shipments ?? 0}</b></div>
+      <div class="tile"><span>Active</span><b>${all.active ?? 0}</b></div>
+      <div class="tile"><span>On-time delivery</span><b>${pct(all.on_time_pct)}</b></div>
+      <div class="tile"><span>Avg delay (h)</span><b>${all.avg_delay_h ?? "—"}</b></div>
+      <div class="tile"><span>Tracking coverage</span><b>${pct(all.tracking_coverage_pct)}</b></div>
+      <div class="tile"><span>Open exceptions</span><b>${Object.values(all.open_exceptions || {}).reduce((a,b)=>a+b,0)}</b></div></div>
+    <div class="card scroll" style="margin-top:14px"><div class="row"><h3 style="margin:0">Breakdown by</h3>
+      <select id="gb"><option value="mode">Mode</option><option value="carrier">Carrier</option><option value="lane">Lane</option></select></div><table id="gt"></table></div>`;
+  const load = async () => {
+    const r = await api("/api/analytics?group_by=" + $("#gb").value);
+    $("#gt").innerHTML = `<tr><th>${esc($("#gb").value)}</th><th>Shipments</th><th>Delivered</th><th>On-time</th><th>Avg delay (h)</th><th>Active</th><th>Coverage</th><th>Open exceptions</th></tr>` +
+      r.groups.map(g => `<tr><td>${esc(g.key)}</td><td>${g.shipments}</td><td>${g.delivered}</td><td>${pct(g.on_time_pct)}</td><td>${g.avg_delay_h ?? "—"}</td>
+        <td>${g.active}</td><td>${pct(g.tracking_coverage_pct)}</td><td>${esc(Object.entries(g.open_exceptions).map(([k,v]) => `${k.toLowerCase()} ${v}`).join(", ") || "—")}</td></tr>`).join("");
+  };
+  $("#gb").onchange = load; load();
+}
+
+// ---------- admin ----------
+async function admin() {
+  const [u, keys, log] = await Promise.all([api("/api/users"), api("/api/api-keys"), api("/api/audit?limit=30")]);
+  $("#main").innerHTML = `<div class="card"><h3 style="margin-top:0">Invite a person</h3>
+      <div class="row"><input id="iv-email" type="email" placeholder="name@company.com" style="min-width:240px">
+      <select id="iv-role"><option value="viewer">Viewer (read-only)</option><option value="member">Member (can ingest/edit)</option><option value="admin">Admin</option></select>
+      <button class="btn" id="iv-go">Create invite link</button></div><div id="iv-out" class="muted">Send the link to that person only. It works once and expires.</div></div>
+    <div class="card scroll"><h3 style="margin-top:0">People</h3><table><tr><th>Email</th><th>Role</th><th>Status</th><th></th></tr>
+      ${u.users.map(x => `<tr><td>${esc(x.email)}</td><td>${esc(x.role)}</td><td>${x.active ? "active" : "revoked"}</td>
+        <td>${x.active && x.email !== me.name ? `<button class="btn ghost" data-revoke="${x.id}">Revoke</button>` : ""}</td></tr>`).join("")}
+      ${u.pending_invites.map(x => `<tr><td>${esc(x.email)}</td><td>${esc(x.role)}</td><td class="muted">invited, expires ${fmt(x.expires_at)}</td><td></td></tr>`).join("")}</table></div>
+    <div class="card scroll"><h3 style="margin-top:0">API keys for integrations</h3>
+      <div class="row"><input id="k-name" placeholder="e.g. TMS connector"><select id="k-role"><option>member</option><option>viewer</option></select><button class="btn" id="k-go">Create key</button></div>
+      <div id="k-out"></div><table><tr><th>Name</th><th>Role</th><th>Created</th><th></th></tr>
+      ${keys.map(k => `<tr><td>${esc(k.name)}</td><td>${esc(k.role)}</td><td>${fmt(k.created_at)}</td><td>${k.revoked ? "revoked" : `<button class="btn ghost" data-key="${k.id}">Revoke</button>`}</td></tr>`).join("")}</table></div>
+    <div class="card scroll"><h3 style="margin-top:0">Audit log</h3><table><tr><th>When</th><th>Who</th><th>Action</th><th>Detail</th></tr>
+      ${log.map(a => `<tr><td>${fmt(a.ts)}</td><td>${esc(a.actor)}</td><td>${esc(a.action)}</td><td>${esc(a.detail)}</td></tr>`).join("")}</table></div>`;
+  $("#iv-go").onclick = async () => {
+    try { const r = await api("/api/users/invite", { method:"POST", body: JSON.stringify({ email: $("#iv-email").value, role: $("#iv-role").value }) });
+      $("#iv-out").innerHTML = `Invite link for ${esc(r.email)} (${esc(r.role)}), valid until ${fmt(r.expires_at)}:<br><code>${esc(r.invite_url)}</code>`;
+    } catch (e) { $("#iv-out").textContent = e.message; }
+  };
+  $("#k-go").onclick = async () => {
+    try { const r = await api("/api/api-keys", { method:"POST", body: JSON.stringify({ name: $("#k-name").value, role: $("#k-role").value }) });
+      $("#k-out").innerHTML = `<p>Copy this key now, it is not shown again:<br><code>${esc(r.key)}</code></p>`;
+    } catch (e) { $("#k-out").textContent = e.message; }
+  };
+  document.querySelectorAll("[data-revoke]").forEach(b => b.onclick = async () => { if (confirm("Revoke this person's access?")) { await api(`/api/users/${b.dataset.revoke}/revoke`, {method:"POST"}); admin(); } });
+  document.querySelectorAll("[data-key]").forEach(b => b.onclick = async () => { await api(`/api/api-keys/${b.dataset.key}`, {method:"DELETE"}); admin(); });
+}
+
+render();
+</script>
+</body>
+</html>
